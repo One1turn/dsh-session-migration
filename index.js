@@ -23,6 +23,9 @@ import path from "node:path";
 
 const LOG = "[dsh-session-migration]";
 const RPC_PATH = "/api/dsh-session-migration";
+function jsonSafe(value) {
+  return JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? Number(v) : v));
+}
 const MSG_CAP = 4000; // 单条消息文本截断
 const TR_CAP = 180_000; // 单会话转录上限
 
@@ -86,26 +89,40 @@ export function apply(ctx, config = {}) {
       const sessionsTotal = db.prepare("SELECT COUNT(*) c FROM session").get().c;
       const messagesTotal = db.prepare("SELECT COUNT(*) c FROM message").get().c;
       const usage = db
-        .prepare("SELECT COUNT(*) rows, SUM(computed_total_tokens) tokens, MIN(started_at) minT, MAX(started_at) maxT FROM model_usage WHERE computed_total_tokens > 0")
+        .prepare("SELECT COUNT(*) rows, CAST(SUM(computed_total_tokens) AS REAL) tokens, MIN(started_at) minT, MAX(started_at) maxT FROM model_usage WHERE computed_total_tokens > 0")
         .get();
       const byModel = db
-        .prepare("SELECT model_id name, SUM(computed_total_tokens) tokens FROM model_usage WHERE computed_total_tokens > 0 GROUP BY model_id ORDER BY tokens DESC LIMIT 6")
+        .prepare("SELECT model_id name, CAST(SUM(computed_total_tokens) AS REAL) tokens FROM model_usage WHERE computed_total_tokens > 0 GROUP BY model_id ORDER BY tokens DESC LIMIT 6")
         .all();
-      const contentSessions = db
-        .prepare(
-          `SELECT COUNT(*) c FROM session s WHERE EXISTS (SELECT 1 FROM message um WHERE um.session_id = s.id AND JSON_EXTRACT(um.data, '$.role') = 'user')
-           AND EXISTS (SELECT 1 FROM message am WHERE am.session_id = s.id AND JSON_EXTRACT(am.data, '$.role') = 'assistant')`,
-        )
-        .get().c;
+      // 可迁移会话数：session 表自带 project/message 关联索引，用轻量子查询避免
+      // 对 4.7 万条 message.data 做 JSON_EXTRACT 全表相关扫描（原实现会卡到超时）。
+      let contentSessions = sessionsTotal;
+      try {
+        contentSessions = db
+          .prepare(
+            `SELECT COUNT(*) c FROM session s
+             WHERE (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) >= 2`,
+          )
+          .get().c;
+      } catch {
+        contentSessions = sessionsTotal;
+      }
+      // 最近会话预览（LIMIT 30 走 session 时间索引，开销可控）
+      let recent = [];
+      try {
+        recent = db
+          .prepare(
+            `SELECT s.id, s.title, s.directory, s.time_updated,
+               (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) msgs
+             FROM session s ORDER BY s.time_updated DESC LIMIT 30`,
+          )
+          .all()
+          .map((r) => ({ id: r.id, title: r.title ?? "(无标题)", directory: r.directory, updated: r.time_updated, msgs: r.msgs }));
+      } catch {
+        recent = [];
+      }
       const state = await readState();
-      const recent = db
-        .prepare(
-          `SELECT s.id, s.title, s.directory, s.time_updated,
-             (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) msgs
-           FROM session s ORDER BY s.time_updated DESC LIMIT 30`,
-        )
-        .all()
-        .map((r) => ({ id: r.id, title: r.title ?? "(无标题)", directory: r.directory, updated: r.time_updated, msgs: r.msgs, migrated: !!state.sessions[r.id] }));
+      for (const r of recent) r.migrated = !!state.sessions[r.id];
       return {
         dbFound: true,
         dbPath: zcodeDb,
@@ -220,6 +237,7 @@ export function apply(ctx, config = {}) {
     const batch = eligible.slice(0, Math.max(1, Math.min(limit ?? 400, 1000)));
     let created = 0;
     let failed = 0;
+    const createdIds = [];
     const failures = [];
     try {
       for (const s of batch) {
@@ -266,6 +284,7 @@ export function apply(ctx, config = {}) {
             console.warn(`${LOG} 挂接工作区失败（会话已创建）: ${e?.message ?? e}`);
           }
           state.sessions[s.id] = { dshId, at: Date.now(), title: s.title };
+          createdIds.push(dshId);
           created += 1;
           if (created % 25 === 0) await writeState(state);
         } catch (error) {
@@ -278,6 +297,7 @@ export function apply(ctx, config = {}) {
       db.close();
       if (created > 0) await writeState(state);
     }
+    await attachInRegistryFile(createdIds);
     return { created, failed, failures, remaining: eligible.length - created };
   }
 
@@ -288,7 +308,7 @@ export function apply(ctx, config = {}) {
       console.warn(`${LOG} connection.fetch 不可用，迁移端点未注册`);
       return;
     }
-    const reply = (rpcId, result) => Response.json({ type: "server-response", rpcId, result });
+    const reply = (rpcId, result) => new Response(jsonSafe({ type: "server-response", rpcId, result }), { headers: { "content-type": "application/json" } });
     connection.fetch.register({
       path: RPC_PATH,
       methods: ["POST"],
@@ -304,7 +324,36 @@ export function apply(ctx, config = {}) {
         const rpcId = typeof message?.rpcId === "string" ? message.rpcId : "invalid";
         const call = message?.payload;
         try {
-          if (call?.method === "migration.scan") {
+          if (call?.method === "migration.attach") {
+            // 活体挂接：通过注册表 API 把已迁移会话挂到「ZCode 迁移」工作区（侧栏即时生效）
+            const registry = ctx.workspaceRegistry ?? ctx.get?.("workspaceRegistry");
+            if (!registry?.resolveByPath) throw new Error("workspaceRegistry 不可用");
+            const entity = await registry.resolveByPath(targetCwd);
+            const state = await readState();
+            // 预热注册表的会话头索引（readSessionHeader 未命中时会全量列出并填充 sessionPaths，
+            // workspaceView.sessionIds 的路径过滤依赖这张表——冷启动时必须先预热）
+            const firstId = Object.values(state.sessions).map((r) => r.dshId).find(Boolean);
+            if (firstId) { try { await registry.readSessionHeader?.(firstId); } catch { /* 未命中也已完成全量索引 */ } }
+            let attached = 0, already = 0, failed = 0;
+            const failures = [];
+            for (const rec of Object.values(state.sessions)) {
+              if (!rec.dshId) continue;
+              if (entity.record.sessionIds.includes(rec.dshId)) { already += 1; continue; }
+              try { await entity.attachSession(rec.dshId); attached += 1; }
+              catch (e) { failed += 1; if (failures.length < 5) failures.push(e?.message ?? String(e)); }
+            }
+            return { attached, already, failed, failures, total: entity.record.sessionIds.length };
+          }
+                    if (call?.method === "migration.debugList") {
+            const persistence = ctx.sessionPersistence ?? ctx.get?.("sessionPersistence");
+            const list = await persistence.list();
+            const target = list.filter((snap) => snap.header.cwd && snap.header.cwd.includes("zcode-migrated"));
+            const probe = list.find((snap) => snap.header.id === (call.payload?.probeId || ""));
+            const cwds = {};
+            for (const snap of list) { const c = snap.header.cwd || "(none)"; cwds[c] = (cwds[c] || 0) + 1; }
+            return reply(rpcId, { ok: true, value: { total: list.length, zcodeMigrated: target.length, cwds, probe: probe ? { id: probe.header.id, cwd: probe.header.cwd } : null } });
+          }
+                    if (call?.method === "migration.scan") {
             return reply(rpcId, { ok: true, value: await scan() });
           }
           if (call?.method === "migration.run") {
@@ -329,6 +378,57 @@ export function apply(ctx, config = {}) {
     });
     console.log(`${LOG} 迁移端点已注册 ${RPC_PATH}（ZCode 库 ${zcodeDb}）`);
   });
+
+  // 把新迁移的 dshId 直接并入工作区注册表（走文件而非 entity.attachSession —— 后者
+  // 依赖 agent 注册表里的会话头，迁移会话没有 agent 会卡住）。重启 DSH 后侧栏生效。
+  async function attachInRegistryFile(dshIds) {
+    if (dshIds.length === 0) return 0;
+    const wf = path.join(dshHome, "storages", "workspace.json");
+    let j;
+    try {
+      j = JSON.parse(await fs.readFile(wf, "utf8"));
+    } catch {
+      return 0;
+    }
+    j.tables ??= {};
+    j.tables.workspaces ??= {};
+    j.global ??= {};
+    j.global.workspaceIds ??= [];
+    let wsId = Object.entries(j.tables.workspaces).find(([, w]) => w.path === targetCwd)?.[0];
+    const now = new Date().toISOString();
+    if (!wsId) {
+      wsId = crypto.randomUUID();
+      j.tables.workspaces[wsId] = { path: targetCwd, title: "ZCode 迁移", sessionIds: [], createdAt: now, updatedAt: now };
+      j.global.workspaceIds.push(wsId);
+    }
+    const record = j.tables.workspaces[wsId];
+    record.title ??= "ZCode 迁移";
+    const set = new Set(record.sessionIds ?? []);
+    let added = 0;
+    for (const id of dshIds) {
+      if (!set.has(id)) {
+        set.add(id);
+        added += 1;
+      }
+    }
+    record.sessionIds = [...set];
+    record.updatedAt = now;
+    await fs.writeFile(wf, JSON.stringify(j, null, 2), "utf8");
+    return added;
+  }
+
+  // 后台补挂：把已迁移但未挂到工作区的会话直接并入注册表文件（每次启动跑一遍）。
+  // 不走 entity.attachSession —— 它依赖 agent 注册表的会话头，迁移会话会卡住。
+  void (async () => {
+    try {
+      const state = await readState();
+      const ids = Object.values(state.sessions).map((r) => r.dshId).filter(Boolean);
+      const added = await attachInRegistryFile(ids);
+      if (added > 0) console.log(`${LOG} 启动补挂完成：${added} 个会话已并入「ZCode 迁移」工作区记录`);
+    } catch (e) {
+      console.warn(`${LOG} 启动补挂失败: ${e?.message ?? e}`);
+    }
+  })();
 
   console.log(`${LOG} 已激活`);
 }
