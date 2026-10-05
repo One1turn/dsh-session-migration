@@ -179,7 +179,7 @@ export function apply(ctx, config = {}) {
   }
 
   // ── 会话导入 ────────────────────────────────────────────────────────────
-  function buildTranscript(db, sessionRow) {
+  function buildTranscript(db, sessionRow, displayTitle) {
     const msgs = db
       .prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, sequence")
       .all(sessionRow.id);
@@ -201,7 +201,7 @@ export function apply(ctx, config = {}) {
       list.push(j.text.trim().slice(0, MSG_CAP));
     }
     const created = new Date(sessionRow.time_created);
-    const head = `# ${sessionRow.title ?? "(无标题)"}\n\n> 迁移自 ZCode · ${created.toLocaleString("zh-CN")} · ${path.basename(sessionRow.directory ?? "") || "未知工作区"}\n`;
+    const head = `# ${displayTitle ?? sessionRow.title ?? "(无标题)"}\n\n> 迁移自 ZCode · ${created.toLocaleString("zh-CN")} · ${path.basename(sessionRow.directory ?? "") || "未知工作区"}\n`;
     const blocks = [head];
     for (const msg of msgs) {
       let d;
@@ -235,6 +235,28 @@ export function apply(ctx, config = {}) {
       .all()
       .filter((s) => !state.sessions[s.id]);
     const batch = eligible.slice(0, Math.max(1, Math.min(limit ?? 400, 1000)));
+    // 工作流子会话（dwf_actor）没有可读标题，ZCode 只给 "workflow subagent actor#N@M"。
+    // 用「工作流名 · 角色名」适配，并对同名追加序号；这类会话迁移后自动归档。
+    const actorBySession = new Map();
+    if (batch.length > 0) {
+      const placeholders = batch.map(() => "?").join(",");
+      for (const a of db.prepare(
+        `SELECT a.session_id sid, a.name an, r.name rn FROM dwf_actor a LEFT JOIN dwf_run r ON r.id=a.run_id WHERE a.session_id IN (${placeholders})`,
+      ).all(...batch.map((s) => s.id))) {
+        if (a.sid) actorBySession.set(a.sid, a);
+      }
+    }
+    const cleanTitle = (x) => (x ?? "").replace(/\s+/gu, " ").trim();
+    const titleCounts = new Map();
+    for (const s of batch) {
+      const a = actorBySession.get(s.id);
+      let base = a ? [cleanTitle(a.rn), cleanTitle(a.an)].filter(Boolean).join(" · ") : cleanTitle(s.title);
+      if (!base) base = a ? "工作流子代理" : "迁移自 ZCode 的会话";
+      const n = (titleCounts.get(base) || 0) + 1;
+      titleCounts.set(base, n);
+      s.__title = n > 1 ? `${base} #${n}` : base;
+      s.__child = !!a;
+    }
     let created = 0;
     let failed = 0;
     const createdIds = [];
@@ -242,7 +264,8 @@ export function apply(ctx, config = {}) {
     try {
       for (const s of batch) {
         try {
-          const transcript = buildTranscript(db, s);
+          const isChild = actorBySession.has(s.id);
+          const transcript = buildTranscript(db, s, s.__title);
           if (transcript.length < 40) continue;
           // 关键：先开持久化写句柄（sessionPersistence.create 会把它登记为该 id 的 live 路由），
           // 再建 store 会话——否则 session/event 事件没有写句柄，flush 不会落盘。
@@ -258,6 +281,9 @@ export function apply(ctx, config = {}) {
           const userEvent = session.append(
             "user/message",
             {
+              // v4 冷读要求 identified message：data.id 必须是非空字符串
+              // （实时 append 不校验，落盘后 sessionQuery 校验，缺了就整库判 corrupt）
+              id: crypto.randomUUID(),
               role: "user",
               content: [{ type: "text", text: transcript }],
               source: { kind: "user" },
@@ -267,7 +293,7 @@ export function apply(ctx, config = {}) {
           try {
             // session/title 的 v4 契约：messageSeqs 必须是数组、source 必须是对象
             session.append("session/title", {
-              title: String(s.title ?? "迁移会话").slice(0, 80),
+              title: String(s.__title ?? s.title ?? "迁移会话").slice(0, 80),
               messageSeqs: userEvent?.seq != null ? [userEvent.seq] : [],
               source: { kind: "fallback" },
             });
@@ -275,15 +301,17 @@ export function apply(ctx, config = {}) {
             // 标题事件写不进去就交给 DSH 自动起名
           }
           await ctx.sessions.flush(session);
-          // 挂到「ZCode 迁移」工作区（按路径匹配注册表实体；不存在则跳过，会话仍可用）
+          // 挂到「ZCode 迁移」工作区；工作流子会话同时归档，别和真正的对话混在主列表
+          let archived = false;
           try {
             const registry = ctx.workspaceRegistry ?? ctx.get?.('workspaceRegistry');
             const entity = registry?.list?.().find((w) => w.record?.path === cwd);
             await entity?.attachSession?.(dshId);
+            if (isChild) { await registry?.archiveSession?.(dshId); archived = true; }
           } catch (e) {
-            console.warn(`${LOG} 挂接工作区失败（会话已创建）: ${e?.message ?? e}`);
+            console.warn(`${LOG} 挂接/归档失败（会话已创建）: ${e?.message ?? e}`);
           }
-          state.sessions[s.id] = { dshId, at: Date.now(), title: s.title };
+          state.sessions[s.id] = { dshId, at: Date.now(), title: s.__title ?? s.title, archived };
           createdIds.push(dshId);
           created += 1;
           if (created % 25 === 0) await writeState(state);
@@ -325,26 +353,14 @@ export function apply(ctx, config = {}) {
         const call = message?.payload;
         try {
           if (call?.method === "migration.attach") {
-            // 活体挂接：通过注册表 API 把已迁移会话挂到「ZCode 迁移」工作区（侧栏即时生效）
-            const registry = ctx.workspaceRegistry ?? ctx.get?.("workspaceRegistry");
-            if (!registry?.resolveByPath) throw new Error("workspaceRegistry 不可用");
-            const entity = await registry.resolveByPath(targetCwd);
+            // 活体挂接：把已迁移 dshId 并入注册表文件（entity.attachSession 对无 agent
+            // 的冷会话会挂起，文件级合并 + 宿主重启即生效）。
             const state = await readState();
-            // 预热注册表的会话头索引（readSessionHeader 未命中时会全量列出并填充 sessionPaths，
-            // workspaceView.sessionIds 的路径过滤依赖这张表——冷启动时必须先预热）
-            const firstId = Object.values(state.sessions).map((r) => r.dshId).find(Boolean);
-            if (firstId) { try { await registry.readSessionHeader?.(firstId); } catch { /* 未命中也已完成全量索引 */ } }
-            let attached = 0, already = 0, failed = 0;
-            const failures = [];
-            for (const rec of Object.values(state.sessions)) {
-              if (!rec.dshId) continue;
-              if (entity.record.sessionIds.includes(rec.dshId)) { already += 1; continue; }
-              try { await entity.attachSession(rec.dshId); attached += 1; }
-              catch (e) { failed += 1; if (failures.length < 5) failures.push(e?.message ?? String(e)); }
-            }
-            return { attached, already, failed, failures, total: entity.record.sessionIds.length };
+            const ids = Object.values(state.sessions).map((r) => r.dshId).filter(Boolean);
+            const added = await attachInRegistryFile(ids);
+            return reply(rpcId, { ok: true, value: { attached: added, already: ids.length - added, total: ids.length } });
           }
-                    if (call?.method === "migration.debugList") {
+          if (call?.method === "migration.debugList") {
             const persistence = ctx.sessionPersistence ?? ctx.get?.("sessionPersistence");
             const list = await persistence.list();
             const target = list.filter((snap) => snap.header.cwd && snap.header.cwd.includes("zcode-migrated"));
@@ -381,7 +397,7 @@ export function apply(ctx, config = {}) {
 
   // 把新迁移的 dshId 直接并入工作区注册表（走文件而非 entity.attachSession —— 后者
   // 依赖 agent 注册表里的会话头，迁移会话没有 agent 会卡住）。重启 DSH 后侧栏生效。
-  async function attachInRegistryFile(dshIds) {
+  async function attachInRegistryFile(dshIds, archiveIds) {
     if (dshIds.length === 0) return 0;
     const wf = path.join(dshHome, "storages", "workspace.json");
     let j;
@@ -413,17 +429,29 @@ export function apply(ctx, config = {}) {
     }
     record.sessionIds = [...set];
     record.updatedAt = now;
+    if (archiveIds?.length) {
+      const arch = new Set(j.global.archivedSessionIds ?? []);
+      for (const id of archiveIds) arch.add(id);
+      j.global.archivedSessionIds = [...arch];
+    }
     await fs.writeFile(wf, JSON.stringify(j, null, 2), "utf8");
     return added;
   }
+
+  // ── 标题说明 ───────────────────────────────────────────────────────────
+  // 侧栏标题在宿主冷读会话日志时由 title 投影自然折叠出来，无需额外预热。
+  // 此前“未命名”的根因是 v4 user/message 缺 data.id 导致冷读判 corrupt，
+  // migrateSessions 现已补齐 id（见上），标题即正常显示。
 
   // 后台补挂：把已迁移但未挂到工作区的会话直接并入注册表文件（每次启动跑一遍）。
   // 不走 entity.attachSession —— 它依赖 agent 注册表的会话头，迁移会话会卡住。
   void (async () => {
     try {
       const state = await readState();
-      const ids = Object.values(state.sessions).map((r) => r.dshId).filter(Boolean);
-      const added = await attachInRegistryFile(ids);
+      const all = Object.values(state.sessions);
+      const ids = all.map((r) => r.dshId).filter(Boolean);
+      const archivedIds = all.filter((r) => r.archived).map((r) => r.dshId).filter(Boolean);
+      const added = await attachInRegistryFile(ids, archivedIds);
       if (added > 0) console.log(`${LOG} 启动补挂完成：${added} 个会话已并入「ZCode 迁移」工作区记录`);
     } catch (e) {
       console.warn(`${LOG} 启动补挂失败: ${e?.message ?? e}`);
