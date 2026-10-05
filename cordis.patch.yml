@@ -1,0 +1,4 @@
+- insert:
+    - id: session-migration
+      name: '@local/dsh-session-migration'
+      config: {}

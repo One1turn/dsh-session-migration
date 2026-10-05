@@ -1,0 +1,14 @@
+<svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="dshsm-grad-file" x1="3" y1="18" x2="21" y2="6" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4D6BFE"/>
+      <stop offset="1" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+  <g stroke="url(#dshsm-grad-file)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 8h12"/>
+    <path d="m12 4 4 4-4 4"/>
+    <path d="M20 16H8"/>
+    <path d="m12 12-4 4 4 4"/>
+  </g>
+</svg>
