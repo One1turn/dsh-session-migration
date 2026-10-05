@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-migration",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "Migrate ZCode sessions and token usage into DeepSeek Harness: import conversations as new DSH sessions (existing ones untouched) and merge ZCode token usage into usage statistics.",
@@ -11,9 +11,18 @@
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
-  "files": ["index.js", "client.js", "icon.svg", "locale/*.json"],
+  "files": [
+    "index.js",
+    "client.js",
+    "icon.svg",
+    "locale/*.json"
+  ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
   }
 }

@@ -237,7 +237,7 @@ export function apply(ctx, config = {}) {
           const session = ctx.sessions.create(dshId, {
             meta: { cwd, createdAt },
           });
-          session.append(
+          const userEvent = session.append(
             "user/message",
             {
               role: "user",
@@ -247,7 +247,12 @@ export function apply(ctx, config = {}) {
             { surfaceOp: "append" },
           );
           try {
-            session.append("session/title", { title: String(s.title ?? "迁移会话").slice(0, 80), source: "user" });
+            // session/title 的 v4 契约：messageSeqs 必须是数组、source 必须是对象
+            session.append("session/title", {
+              title: String(s.title ?? "迁移会话").slice(0, 80),
+              messageSeqs: userEvent?.seq != null ? [userEvent.seq] : [],
+              source: { kind: "fallback" },
+            });
           } catch {
             // 标题事件写不进去就交给 DSH 自动起名
           }
